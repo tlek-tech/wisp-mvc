@@ -1,6 +1,6 @@
 # wisp-mvc
 
-MVC (Model-View-Controller) architecture plugin for the [Wisp](../wisp) PHP micro-framework.
+MVC (Model-View-Controller) architecture plugin for the [Wisp](https://github.com/tlek-tech/wisp) PHP micro-framework.
 
 Adds base `Controller`, `Model` (Active Record with query builder), and `View` (Blade-style template compiler with caching) classes, route resolution for `'Controller@action'` and `['Controller', 'action']` syntax, automatic constructor dependency injection via Wisp's container, and directory autoloading for `app/controllers/` and `app/models/`.
 
