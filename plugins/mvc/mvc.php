@@ -3,11 +3,14 @@ namespace Wisp;
 
 // 1. Directory Autoloader for Controllers and Models
 spl_autoload_register(function ($class) {
-    $baseDir = realpath(__DIR__ . '/../../') . '/';
+    $baseDir = (defined('APP_ROOT') ? APP_ROOT : realpath(__DIR__ . '/../../')) . '/';
     $dirs = [
         $baseDir . 'app/controllers/',
         $baseDir . 'app/models/',
+        realpath(__DIR__ . '/../../') . '/app/controllers/',
+        realpath(__DIR__ . '/../../') . '/app/models/',
     ];
+    $dirs = array_unique($dirs);
     foreach ($dirs as $dir) {
         // Strip namespace if present
         $parts = explode('\\', $class);
@@ -39,21 +42,156 @@ class Controller {
     }
 }
 
-// 3. Model Query Builder
-class ModelQueryBuilder extends DbBuilder {
+// 3. Standalone Model Query Builder (Pure Wisp\DB - Zero external dependencies)
+class ModelQueryBuilder {
+    protected string $table;
     protected string $modelClass;
+    protected array $wheres = [];
+    protected array $bindings = [];
+    protected array $orders = [];
+    protected ?int $limit = null;
+    protected ?int $offset = null;
+
+    public function __construct(string $table, string $modelClass = '') {
+        $this->table = $table;
+        $this->modelClass = $modelClass;
+    }
 
     public function setModelClass(string $modelClass): self {
         $this->modelClass = $modelClass;
         return $this;
     }
 
+    public function getModelClass(): string {
+        return $this->modelClass;
+    }
+
+    public function where($column, $operator = null, $value = null, string $boolean = 'AND'): self {
+        if (is_array($column)) {
+            foreach ($column as $col => $val) {
+                $this->where($col, '=', $val, $boolean);
+            }
+            return $this;
+        }
+
+        if ($value === null && $operator !== null) {
+            $value = $operator;
+            $operator = '=';
+        }
+
+        $this->wheres[] = [
+            'type' => 'basic',
+            'column' => $column,
+            'operator' => strtoupper((string)$operator),
+            'value' => $value,
+            'boolean' => strtoupper($boolean),
+        ];
+        $this->bindings[] = $value;
+
+        return $this;
+    }
+
+    public function orWhere($column, $operator = null, $value = null): self {
+        return $this->where($column, $operator, $value, 'OR');
+    }
+
+    public function whereIn(string $column, array $values, string $boolean = 'AND'): self {
+        if (empty($values)) {
+            $this->wheres[] = [
+                'type' => 'raw',
+                'sql' => '0 = 1',
+                'boolean' => strtoupper($boolean),
+            ];
+            return $this;
+        }
+
+        $placeholders = implode(', ', array_fill(0, count($values), '?'));
+        $this->wheres[] = [
+            'type' => 'raw',
+            'sql' => $this->quoteIdentifier($column) . " IN ($placeholders)",
+            'boolean' => strtoupper($boolean),
+        ];
+        foreach ($values as $v) {
+            $this->bindings[] = $v;
+        }
+
+        return $this;
+    }
+
+    public function whereNotIn(string $column, array $values, string $boolean = 'AND'): self {
+        if (empty($values)) {
+            return $this;
+        }
+
+        $placeholders = implode(', ', array_fill(0, count($values), '?'));
+        $this->wheres[] = [
+            'type' => 'raw',
+            'sql' => $this->quoteIdentifier($column) . " NOT IN ($placeholders)",
+            'boolean' => strtoupper($boolean),
+        ];
+        foreach ($values as $v) {
+            $this->bindings[] = $v;
+        }
+
+        return $this;
+    }
+
+    public function whereNull(string $column, string $boolean = 'AND'): self {
+        $this->wheres[] = [
+            'type' => 'raw',
+            'sql' => $this->quoteIdentifier($column) . " IS NULL",
+            'boolean' => strtoupper($boolean),
+        ];
+        return $this;
+    }
+
+    public function whereNotNull(string $column, string $boolean = 'AND'): self {
+        $this->wheres[] = [
+            'type' => 'raw',
+            'sql' => $this->quoteIdentifier($column) . " IS NOT NULL",
+            'boolean' => strtoupper($boolean),
+        ];
+        return $this;
+    }
+
+    public function orderBy(string $column, string $direction = 'ASC'): self {
+        $dir = strtoupper($direction) === 'DESC' ? 'DESC' : 'ASC';
+        $this->orders[] = $this->quoteIdentifier($column) . ' ' . $dir;
+        return $this;
+    }
+
+    public function latest(string $column = 'id'): self {
+        return $this->orderBy($column, 'DESC');
+    }
+
+    public function oldest(string $column = 'id'): self {
+        return $this->orderBy($column, 'ASC');
+    }
+
+    public function limit(int $limit): self {
+        $this->limit = $limit;
+        return $this;
+    }
+
+    public function offset(int $offset): self {
+        $this->offset = $offset;
+        return $this;
+    }
+
     public function get(): array {
-        $rows = parent::get();
+        $sql = $this->toSelectSql();
+        $rows = DB::query($sql, $this->bindings);
+
+        if (empty($this->modelClass) || !class_exists($this->modelClass)) {
+            return $rows;
+        }
+
         $results = [];
         foreach ($rows as $row) {
             $instance = new $this->modelClass();
-            $instance->forceFill($row);
+            if (method_exists($instance, 'forceFill')) {
+                $instance->forceFill($row);
+            }
             $results[] = $instance;
         }
         return $results;
@@ -64,9 +202,100 @@ class ModelQueryBuilder extends DbBuilder {
         $results = $this->get();
         return !empty($results) ? $results[0] : null;
     }
+
+    public function count(): int {
+        $sql = "SELECT COUNT(*) FROM " . $this->quoteIdentifier($this->table);
+        $whereSql = $this->compileWheres();
+        if ($whereSql !== '') {
+            $sql .= ' WHERE ' . $whereSql;
+        }
+        $val = DB::value($sql, $this->bindings);
+        return (int)$val;
+    }
+
+    public function update(array $values): int {
+        if (empty($values)) {
+            return 0;
+        }
+
+        $sets = [];
+        $updateBindings = [];
+        foreach ($values as $col => $val) {
+            $sets[] = $this->quoteIdentifier($col) . " = ?";
+            $updateBindings[] = $val;
+        }
+
+        $sql = "UPDATE " . $this->quoteIdentifier($this->table) . " SET " . implode(', ', $sets);
+        $whereSql = $this->compileWheres();
+        if ($whereSql !== '') {
+            $sql .= ' WHERE ' . $whereSql;
+        }
+
+        $allBindings = array_merge($updateBindings, $this->bindings);
+        return DB::execute($sql, $allBindings);
+    }
+
+    public function delete(): int {
+        $sql = "DELETE FROM " . $this->quoteIdentifier($this->table);
+        $whereSql = $this->compileWheres();
+        if ($whereSql !== '') {
+            $sql .= ' WHERE ' . $whereSql;
+        }
+        return DB::execute($sql, $this->bindings);
+    }
+
+    public function quoteIdentifier(string $identifier): string {
+        $driver = strtolower($_ENV['DB_CONNECTION'] ?? 'mysql');
+        $q = ($driver === 'mysql') ? '`' : '"';
+        if (strpos($identifier, '.') !== false) {
+            return implode('.', array_map(fn($part) => $q . str_replace($q, '', $part) . $q, explode('.', $identifier)));
+        }
+        return $q . str_replace($q, '', $identifier) . $q;
+    }
+
+    protected function compileWheres(): string {
+        if (empty($this->wheres)) {
+            return '';
+        }
+
+        $sql = '';
+        foreach ($this->wheres as $i => $w) {
+            $clause = '';
+            if ($w['type'] === 'basic') {
+                $clause = $this->quoteIdentifier($w['column']) . ' ' . $w['operator'] . ' ?';
+            } elseif ($w['type'] === 'raw') {
+                $clause = $w['sql'];
+            }
+
+            if ($i === 0) {
+                $sql .= $clause;
+            } else {
+                $sql .= ' ' . $w['boolean'] . ' ' . $clause;
+            }
+        }
+        return $sql;
+    }
+
+    protected function toSelectSql(): string {
+        $sql = "SELECT * FROM " . $this->quoteIdentifier($this->table);
+        $whereSql = $this->compileWheres();
+        if ($whereSql !== '') {
+            $sql .= ' WHERE ' . $whereSql;
+        }
+        if (!empty($this->orders)) {
+            $sql .= ' ORDER BY ' . implode(', ', $this->orders);
+        }
+        if ($this->limit !== null) {
+            $sql .= ' LIMIT ' . (int)$this->limit;
+        }
+        if ($this->offset !== null) {
+            $sql .= ' OFFSET ' . (int)$this->offset;
+        }
+        return $sql;
+    }
 }
 
-// 4. Base Model Class (Active Record)
+// 4. Base Model Class (Active Record - Pure Wisp\DB)
 class Model {
     protected string $table = '';
     protected string $primaryKey = 'id';
@@ -100,6 +329,10 @@ class Model {
         return isset($this->attributes[$key]);
     }
 
+    public function getPrimaryKey(): string {
+        return $this->primaryKey;
+    }
+
     public static function getTable(): string {
         $static = new static();
         if (!empty($static->table)) {
@@ -120,9 +353,7 @@ class Model {
 
     public static function query(): ModelQueryBuilder {
         $table = static::getTable();
-        $builder = new ModelQueryBuilder($table);
-        $builder->setModelClass(static::class);
-        return $builder;
+        return new ModelQueryBuilder($table, static::class);
     }
 
     public static function all(): array {
@@ -142,7 +373,7 @@ class Model {
     public function save(): bool {
         $primaryKey = $this->primaryKey;
         $table = static::getTable();
-        $builder = new DbBuilder($table);
+        $query = static::query();
 
         if (isset($this->attributes[$primaryKey])) {
             $id = $this->attributes[$primaryKey];
@@ -153,15 +384,22 @@ class Model {
                 return true;
             }
             
-            return $builder->where($primaryKey, $id)->update($data) >= 0;
+            return $query->where($primaryKey, $id)->update($data) >= 0;
         } else {
-            $success = $builder->insert($this->attributes);
+            $cols = array_keys($this->attributes);
+            if (empty($cols)) {
+                return false;
+            }
+            $quotedCols = array_map([$query, 'quoteIdentifier'], $cols);
+            $placeholders = array_fill(0, count($cols), '?');
+            $sql = "INSERT INTO " . $query->quoteIdentifier($table) . " (" . implode(', ', $quotedCols) . ") VALUES (" . implode(', ', $placeholders) . ")";
+            
+            $success = DB::execute($sql, array_values($this->attributes)) > 0;
             if ($success) {
                 try {
-                    $pdo = DB::connect();
-                    $id = $pdo->lastInsertId();
-                    if ($id) {
-                        $this->attributes[$primaryKey] = (int)$id;
+                    $newId = DB::lastInsertId();
+                    if ($newId) {
+                        $this->attributes[$primaryKey] = is_numeric($newId) ? (int)$newId : $newId;
                     }
                 } catch (\Exception $e) {}
             }
@@ -175,9 +413,7 @@ class Model {
             return false;
         }
         $id = $this->attributes[$primaryKey];
-        $table = static::getTable();
-        $builder = new DbBuilder($table);
-        return $builder->where($primaryKey, $id)->delete() > 0;
+        return static::query()->where($primaryKey, $id)->delete() > 0;
     }
 
     public function toArray(): array {
@@ -221,7 +457,9 @@ class View {
         if (self::$layout !== null) {
             $layoutView = self::$layout;
             self::$layout = null;
-            return self::renderToString($layoutView, array_merge($data, ['content' => $content]));
+            $output = self::renderToString($layoutView, array_merge($data, ['content' => $content]));
+            self::$sections = [];
+            return $output;
         }
 
         return $content;
@@ -262,12 +500,21 @@ class View {
 
     protected static function getViewPath(string $view): string {
         $view = str_replace('.', '/', $view);
-        return realpath(__DIR__ . '/../../') . '/app/views/' . $view . '.view.php';
+        $projectPath = (defined('APP_ROOT') ? APP_ROOT : realpath(__DIR__ . '/../../')) . '/app/views/' . $view . '.view.php';
+        if (file_exists($projectPath)) {
+            return $projectPath;
+        }
+        $pluginPath = realpath(__DIR__ . '/../../') . '/app/views/' . $view . '.view.php';
+        if (file_exists($pluginPath)) {
+            return $pluginPath;
+        }
+        return $projectPath;
     }
 
     protected static function getCompiledPath(string $view): string {
         $view = str_replace('.', '_', $view);
-        return realpath(__DIR__ . '/../../') . '/storage/views/' . $view . '.compiled.php';
+        $appRoot = defined('APP_ROOT') ? APP_ROOT : realpath(__DIR__ . '/../../');
+        return $appRoot . '/storage/views/' . $view . '.compiled.php';
     }
 
     protected static function compile(string $src, string $dest) {

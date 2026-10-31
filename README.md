@@ -9,7 +9,7 @@ Adds base `Controller`, `Model` (Active Record with query builder), and `View` (
 Your Wisp core must support the plugin extension points this relies on:
 - Callback resolution via `$app->registerCallbackResolver()`
 - Dependency injection via `$app->resolve()`
-- Database query builder `\Wisp\DbBuilder` and `\Wisp\DB`
+- Database support via core `\Wisp\DB` (Zero external dependencies; completely independent from `wisp-db-builder`)
 - The `plugins/` auto-loader in `public/index.php` (loads `plugins/<name>/<name>.php`)
 - Write permissions for `storage/views/` (for compiled template caching)
 
@@ -84,6 +84,9 @@ $item->save();
 
 // Delete
 $item->delete();
+
+// Raw query via Wisp Core DB wrapper (DB.php)
+$topProducts = \Wisp\DB::query("SELECT * FROM products WHERE price > :price ORDER BY price DESC", ['price' => 10.00]);
 ```
 
 ### 3. Views (Blade-Style Templates)
